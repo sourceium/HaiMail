@@ -472,7 +472,7 @@ let state = {
     viewingTrash: false 
 }; 
 let toastTimeout = null;
-const API_BASE_URL = 'https://api.mail.tm'; const SESSION_KEY = 'haiMailSession'; const HISTORY_KEY = 'haiMailHistory'; const THEME_KEY = 'haiMailTheme';
+const API_BASE_URL = 'https://r-gengpt-api.vercel.app/api/tamp-mail'; const API_PROVIDER = 'rgengpt'; const SESSION_KEY = 'haiMailSession'; const HISTORY_KEY = 'haiMailHistory'; const THEME_KEY = 'haiMailTheme';
 
 const DOMElements = { 
     splashScreen: document.getElementById('splash-screen'), 
@@ -517,167 +517,200 @@ const DOMElements = {
     toastActionBtn: document.getElementById('toast-action-btn'), 
 };
 
-const Storage = { 
-    saveSession: () => { 
-        if (state.account) {
-            localStorage.setItem(SESSION_KEY, JSON.stringify({ 
-                account: state.account, 
-                messages: state.messages,
-                deletedIds: state.deletedIds 
-            })); 
-        }
-    }, 
-    loadSession: () => { 
-        const saved = localStorage.getItem(SESSION_KEY); 
-        if (saved) { 
-            try { 
-                const session = JSON.parse(saved); 
-                if (session && session.account) { 
-                    state.account = session.account; 
-                    state.messages = session.messages || []; 
-                    state.deletedIds = session.deletedIds || [];
-                    return true; 
-                } 
-            } catch (e) { localStorage.removeItem(SESSION_KEY); } 
-        } return false; 
-    }, 
-    clearSession: () => localStorage.removeItem(SESSION_KEY), 
-    getHistory: () => { const history = localStorage.getItem(HISTORY_KEY); return history ? JSON.parse(history) : []; }, 
-    saveToHistory: (account) => { 
-        if (!account || !account.address) return; 
-        let history = Storage.getHistory(); 
-        history = history.filter(acc => acc.address !== account.address); 
-        history.unshift(account); 
-        if (history.length > 20) history.pop(); 
-        localStorage.setItem(HISTORY_KEY, JSON.stringify(history)); 
-    }, 
-    removeFromHistory: (address) => { 
-        let history = Storage.getHistory(); 
-        history = history.filter(acc => acc.address !== address); 
-        localStorage.setItem(HISTORY_KEY, JSON.stringify(history)); 
-    }, 
-    clearHistory: () => { localStorage.removeItem(HISTORY_KEY); } 
+const ALNUM = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+// Cryptographically secure random string (rejection sampling avoids modulo bias).
+const rand = (len, alphabet = 'abcdefghijklmnopqrstuvwxyz0123456789') => {
+    const out = []; const limit = 256 - (256 % alphabet.length); const buf = new Uint8Array(len * 2);
+    while (out.length < len) { crypto.getRandomValues(buf); for (const b of buf) { if (b < limit && out.length < len) out.push(alphabet[b % alphabet.length]); } }
+    return out.join('');
+};
+const senderOf = (msg) => (msg && msg.from && (msg.from.name || msg.from.address)) || 'Unknown';
+const initialOf = (name) => (Array.from(String(name))[0] || '?').toUpperCase();
+
+const Storage = {
+    get: (key) => { try { return localStorage.getItem(key); } catch (e) { return null; } },
+    set: (key, value) => { try { localStorage.setItem(key, value); return true; } catch (e) { return false; } },
+    remove: (key) => { try { localStorage.removeItem(key); } catch (e) {} },
+    saveSession: () => {
+        if (state.account) { Storage.set(SESSION_KEY, JSON.stringify({ account: state.account, messages: state.messages, deletedIds: state.deletedIds })); }
+    },
+    loadSession: () => {
+        const saved = Storage.get(SESSION_KEY);
+        if (saved) {
+            try {
+                const session = JSON.parse(saved);
+                if (session && session.account && session.account.address && session.account.token && session.account.provider === API_PROVIDER) {
+                    state.account = session.account;
+                    state.messages = Array.isArray(session.messages) ? session.messages : [];
+                    state.deletedIds = Array.isArray(session.deletedIds) ? session.deletedIds : [];
+                    return true;
+                }
+            } catch (e) { Storage.remove(SESSION_KEY); }
+        } return false;
+    },
+    clearSession: () => Storage.remove(SESSION_KEY),
+    getHistory: () => {
+        try { const h = JSON.parse(Storage.get(HISTORY_KEY) || '[]'); return Array.isArray(h) ? h.filter(a => a && a.address && a.provider === API_PROVIDER) : []; }
+        catch (e) { return []; }
+    },
+    saveToHistory: (account, deletedIds = []) => {
+        if (!account || !account.address) return;
+        let history = Storage.getHistory().filter(acc => acc.address !== account.address);
+        history.unshift({ ...account, deletedIds: deletedIds.slice() });
+        if (history.length > 20) history.pop();
+        Storage.set(HISTORY_KEY, JSON.stringify(history));
+    },
+    removeFromHistory: (address) => { Storage.set(HISTORY_KEY, JSON.stringify(Storage.getHistory().filter(acc => acc.address !== address))); },
+    clearHistory: () => { Storage.remove(HISTORY_KEY); }
 };
 
-async function fetchWithTimeout(resource, options = {}, timeout = 8000) { 
-    const controller = new AbortController(); const id = setTimeout(() => controller.abort(), timeout); 
-    try { 
-        const response = await fetch(resource, { ...options, signal: controller.signal }); 
-        clearTimeout(id); 
-        if (!response.ok) { 
-            if (response.status === 401) { showToast('Session expired. Getting new email...', 'error'); return null; } 
-            throw new Error(`HTTP error! status: ${response.status}`); 
-        } 
-        return response; 
-    } catch (error) { 
-        clearTimeout(id); throw new Error(`Fetch error: ${error.message}`); 
-    } 
+// R-GenGPT API: GET ?action=init | check&token= | read&token=&id=  ->  { status: "success", data: {...} }
+async function apiCall(action, params = {}, timeout = 10000) {
+    const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), timeout);
+    try {
+        const response = await fetch(`${API_BASE_URL}?${new URLSearchParams({ action, ...params })}`, { signal: controller.signal });
+        let result = null;
+        try { result = await response.json(); } catch (e) {}
+        if (!response.ok || !result || result.status !== 'success') {
+            const msg = result?.error?.message || (response.ok ? 'API error' : `HTTP error! status: ${response.status}`);
+            const err = new Error(msg);
+            // 401 = token/session no longer valid
+            err.status = ([401, 403].includes(response.status) || /token|session|expired|invalid|unauthor/i.test(msg)) ? 401 : (response.ok ? 502 : response.status);
+            throw err;
+        }
+        return result.data;
+    } catch (error) {
+        if (error.status) throw error;
+        throw new Error(`Fetch error: ${error.message}`);
+    } finally { clearTimeout(timer); }
 }
 
-async function getNewEmail(button = null) { 
-    if (button) showSpinner(button, true); Storage.saveToHistory(state.account); 
-    try { 
-        const domainResponse = await fetchWithTimeout(`${API_BASE_URL}/domains`); 
-        if (!domainResponse) throw new Error("Could not fetch domains."); 
-        const domains = await domainResponse.json(); const domain = domains['hydra:member'][0].domain; 
-        const address = `${Math.random().toString(36).substring(7)}@${domain}`; const password = Math.random().toString(36).substring(2); 
-        
-        const accountResponse = await fetchWithTimeout(`${API_BASE_URL}/accounts`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ address, password }), }); 
-        if (!accountResponse) throw new Error("Could not create account."); const accountData = await accountResponse.json(); 
-        
-        const tokenResponse = await fetchWithTimeout(`${API_BASE_URL}/token`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ address, password }), }); 
-        if (!tokenResponse) throw new Error("Could not get token."); const { token } = await tokenResponse.json(); 
-        
-        state.account = { id: accountData.id, address, password, token }; 
-        state.messages = []; state.deletedIds = []; 
-        Storage.saveSession(); UI.updateEmailDisplay(); UI.renderInbox(); startInboxPolling(); showToast('New email address ready', 'check_circle'); 
-    } catch (error) { 
-        console.error('Failed to get new email:', error); showToast('Error creating email. Try again.', 'error'); UI.updateEmailDisplay(); 
-    } finally { if (button) showSpinner(button, false); } 
+function parseApiDate(str) {
+    const m = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})/.exec(String(str || ''));
+    const d = m ? new Date(`${m[1]}T${m[2]}Z`) : null; // API timestamps are treated as UTC
+    return d && !isNaN(d) ? d : null;
+}
+function parseSender(from) {
+    const str = String(from || '').trim(); const m = /^(.*?)\s*<([^>]+)>$/.exec(str);
+    return m ? { name: m[1].replace(/^"|"$/g, '').trim(), address: m[2] } : { name: '', address: str };
+}
+// Maps an API mail item to the shape the UI uses; falls back to first-seen time if the date can't be parsed.
+function normalizeMail(m, prev) {
+    const d = parseApiDate(m.date);
+    return { id: String(m.id), from: parseSender(m.from), subject: m.subject || '', intro: m.excerpt || '',
+             createdAt: d ? d.toISOString() : ((prev && prev.createdAt) || new Date().toISOString()) };
 }
 
-async function checkInbox(manual = false) { 
-    if (!state.account?.token) return; 
-    if(manual) { showSpinner(DOMElements.refreshBtn, true); showSpinner(DOMElements.desktopRefreshBtn, true); } 
-    try { 
-        const response = await fetchWithTimeout(`${API_BASE_URL}/messages`, { headers: { 'Authorization': `Bearer ${state.account.token}` }, }); 
-        if (!response) return; 
-        const data = await response.json(); const newMessages = data['hydra:member']; 
-        newMessages.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)); 
-        
+let creatingEmail = false;
+async function getNewEmail(button = null) {
+    if (creatingEmail) return;
+    creatingEmail = true;
+    if (button) showSpinner(button, true);
+    const previous = state.account; const previousDeleted = state.deletedIds;
+    try {
+        const data = await apiCall('init', {}, 15000);
+        if (!data?.email || !data?.token) throw new Error("Invalid init response.");
+        Storage.saveToHistory(previous, previousDeleted);
+        state.account = { address: data.email, token: data.token, provider: API_PROVIDER, purgedIds: [] };
+        state.messages = []; state.deletedIds = [];
+        Storage.saveSession(); UI.updateEmailDisplay(); UI.renderInbox(); UI.renderTrash(); startInboxPolling(); showToast('New email address ready', 'check_circle');
+    } catch (error) {
+        console.error('Failed to get new email:', error); showToast('Error creating email. Try again.', 'error'); UI.updateEmailDisplay();
+    } finally { creatingEmail = false; if (button) showSpinner(button, false); }
+}
+
+async function checkInbox(manual = false) {
+    const account = state.account;
+    if (!account?.token) return;
+    if (manual) { showSpinner(DOMElements.refreshBtn, true); showSpinner(DOMElements.desktopRefreshBtn, true); }
+    try {
+        const data = await apiCall('check', { token: account.token });
+        if (state.account !== account) return; // account changed while the request was in flight
+        const purged = account.purgedIds || []; const prev = new Map(state.messages.map(m => [m.id, m]));
+        const newMessages = (Array.isArray(data.emails) ? data.emails : []).filter(m => m && m.id != null)
+            .map(m => normalizeMail(m, prev.get(String(m.id)))).filter(m => !purged.includes(m.id));
+        newMessages.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+
         const currentInboxCount = state.messages.filter(m => !state.deletedIds.includes(m.id)).length;
         const newInboxCount = newMessages.filter(m => !state.deletedIds.includes(m.id)).length;
-        
-        if (newInboxCount > currentInboxCount) { showToast(`${newInboxCount - currentInboxCount} new email(s)!`, 'mark_email_unread'); } 
-        state.messages = newMessages; 
+        if (newInboxCount > currentInboxCount) { showToast(`${newInboxCount - currentInboxCount} new email(s)!`, 'mark_email_unread'); }
+        state.messages = newMessages;
         Storage.saveSession(); UI.renderInbox(); UI.renderTrash();
-    } catch (error) { 
-        console.error('Failed to check inbox:', error); 
-    } finally { 
-        if(manual) { showSpinner(DOMElements.refreshBtn, false, 'refresh'); showSpinner(DOMElements.desktopRefreshBtn, false, 'refresh'); } 
-    } 
+    } catch (error) {
+        console.error('Failed to check inbox:', error);
+        if (error.status === 401 && state.account === account) { showToast('Inbox expired. Getting new email...', 'error'); getNewEmail(); }
+    } finally {
+        if (manual) { showSpinner(DOMElements.refreshBtn, false, 'refresh'); showSpinner(DOMElements.desktopRefreshBtn, false, 'refresh'); }
+    }
 }
 
-async function openEmail(id, fromTrash = false) { 
-    showToast('Loading email...', 'downloading'); 
-    try { 
-        const response = await fetchWithTimeout(`${API_BASE_URL}/messages/${id}`, { headers: { 'Authorization': `Bearer ${state.account.token}` }, }); 
-        if (!response) return; 
-        const message = await response.json(); 
-        state.currentMessage = message; 
+async function openEmail(id, fromTrash = false) {
+    const account = state.account; if (!account) return;
+    showToast('Loading email...', 'downloading');
+    try {
+        const data = await apiCall('read', { token: account.token, id });
+        if (state.account !== account) return;
+        const listed = state.messages.find(m => m.id === String(id));
+        const message = {
+            id: String(id), subject: data.subject || listed?.subject || '',
+            from: data.from ? parseSender(data.from) : (listed?.from || { name: '', address: '' }),
+            createdAt: parseApiDate(data.date)?.toISOString() || listed?.createdAt || new Date().toISOString(),
+            html: data.message_body?.raw_html ? [data.message_body.raw_html] : [],
+            text: data.message_body?.clean_text || ''
+        };
+        state.currentMessage = message;
         state.viewingTrash = fromTrash;
-        UI.renderEmailDetails(message); 
-        UI.navigateTo('details'); 
-    } catch (error) { showToast('Could not load email.', 'error'); } 
+        UI.renderEmailDetails(message);
+        UI.navigateTo('details');
+    } catch (error) { showToast('Could not load email.', 'error'); }
+}
+
+// The API has no delete endpoint, so permanent deletes are hidden locally (kept per account).
+function purgeMessages(ids) {
+    state.account.purgedIds = Array.from(new Set([...(state.account.purgedIds || []), ...ids]));
+    state.messages = state.messages.filter(m => !ids.includes(m.id));
+    state.deletedIds = state.deletedIds.filter(id => !ids.includes(id));
+    Storage.saveSession();
+}
+
+function buildMessageItem(msg, fromTrash) {
+    const item = document.createElement('div'); item.className = "history-item"; item.onclick = () => openEmail(msg.id, fromTrash);
+    const name = senderOf(msg);
+    const isNew = !fromTrash && (Date.now() - new Date(msg.createdAt).getTime()) < 600000;
+    item.innerHTML = `<div class="avatar ${isNew ? 'new' : ''}">${escapeHTML(initialOf(name))}</div> <div class="item-content"> <div class="item-top"> <span class="sender">${escapeHTML(name)}</span> <span class="time">${formatDate(msg.createdAt)}</span> </div> <div class="subject">${escapeHTML(msg.subject || '(No Subject)')}</div> <div class="snippet">${escapeHTML(msg.intro || '')}</div> </div>`;
+    return item;
 }
 
 const UI = { 
-    toggleTheme: () => { 
-        const current = document.documentElement.getAttribute('data-theme'); const newTheme = current === 'dark' ? 'light' : 'dark'; 
-        document.documentElement.setAttribute('data-theme', newTheme); localStorage.setItem(THEME_KEY, newTheme); UI.updateThemeIcon(newTheme); 
-    }, 
-    updateThemeIcon: (theme) => { 
-        if (theme === 'dark') { DOMElements.themeIcon.textContent = 'light_mode'; DOMElements.themeText.textContent = 'Light Mode'; } 
-        else { DOMElements.themeIcon.textContent = 'dark_mode'; DOMElements.themeText.textContent = 'Dark Mode'; } 
-    }, 
-    renderInbox: () => { 
-        DOMElements.inboxList.innerHTML = ''; 
-        const inboxMessages = state.messages.filter(m => !state.deletedIds.includes(m.id));
-        if (inboxMessages.length === 0) { 
-            DOMElements.inboxList.appendChild(DOMElements.emptyInbox); 
-        } else { 
-            inboxMessages.forEach(msg => { 
-                const emailItem = document.createElement('div'); emailItem.className = "history-item"; emailItem.onclick = () => openEmail(msg.id, false); 
-                const senderName = msg.from.name || msg.from.address; const senderInitial = senderName[0].toUpperCase(); 
-                const isNew = (Date.now() - new Date(msg.createdAt).getTime()) < 600000; 
-                emailItem.innerHTML = ` <div class="avatar ${isNew ? 'new' : ''}">${senderInitial}</div> <div class="item-content"> <div class="item-top"> <span class="sender">${escapeHTML(senderName)}</span> <span class="time">${formatDate(msg.createdAt)}</span> </div> <div class="subject">${escapeHTML(msg.subject || '(No Subject)')}</div> <div class="snippet">${escapeHTML(msg.intro || '')}</div> </div>`; 
-                DOMElements.inboxList.appendChild(emailItem); 
-            }); 
-        } 
-    }, 
-    renderTrash: () => {
-        DOMElements.trashList.innerHTML = ''; 
-        const trashMessages = state.messages.filter(m => state.deletedIds.includes(m.id));
-        if (trashMessages.length === 0) { 
-            DOMElements.trashList.innerHTML = `<div class="inbox-empty"><span class="material-symbols-outlined" style="font-size:48px; color:var(--text-secondary); margin-bottom:12px; display:block;">delete_outline</span><div class="big">Recycle Bin is empty</div><div class="small">Deleted emails will appear here.</div></div>`;
-        } else { 
-            trashMessages.forEach(msg => { 
-                const emailItem = document.createElement('div'); emailItem.className = "history-item"; emailItem.onclick = () => openEmail(msg.id, true); 
-                const senderName = msg.from.name || msg.from.address; const senderInitial = senderName[0].toUpperCase(); 
-                emailItem.innerHTML = ` <div class="avatar">${senderInitial}</div> <div class="item-content"> <div class="item-top"> <span class="sender">${escapeHTML(senderName)}</span> <span class="time">${formatDate(msg.createdAt)}</span> </div> <div class="subject">${escapeHTML(msg.subject || '(No Subject)')}</div> <div class="snippet">${escapeHTML(msg.intro || '')}</div> </div>`; 
-                DOMElements.trashList.appendChild(emailItem); 
-            }); 
-        }
+    toggleTheme: () => {
+        const current = document.documentElement.getAttribute('data-theme'); const newTheme = current === 'dark' ? 'light' : 'dark';
+        document.documentElement.setAttribute('data-theme', newTheme); Storage.set(THEME_KEY, newTheme); UI.updateThemeIcon(newTheme);
     },
-    renderEmailDetails: (message) => { 
-        DOMElements.emailSubjectHeader.textContent = message.subject || '(No Subject)'; 
-        DOMElements.emailSenderName.textContent = message.from.name || message.from.address; 
-        DOMElements.emailSenderAddress.textContent = `<${message.from.address}>`; 
-        DOMElements.emailTimestamp.textContent = new Date(message.createdAt).toLocaleString(); 
-        DOMElements.emailAvatar.textContent = (message.from.name || message.from.address)[0].toUpperCase(); 
-        if (message.html && message.html.length > 0) { DOMElements.emailBody.innerHTML = message.html[0]; } 
-        else { DOMElements.emailBody.innerHTML = `<p>${escapeHTML(message.text || '')}</p>`; } 
-        
+    updateThemeIcon: (theme) => {
+        if (theme === 'dark') { DOMElements.themeIcon.textContent = 'light_mode'; DOMElements.themeText.textContent = 'Light Mode'; }
+        else { DOMElements.themeIcon.textContent = 'dark_mode'; DOMElements.themeText.textContent = 'Dark Mode'; }
+    },
+    renderInbox: () => {
+        DOMElements.inboxList.innerHTML = '';
+        const inboxMessages = state.messages.filter(m => !state.deletedIds.includes(m.id));
+        if (inboxMessages.length === 0) { DOMElements.inboxList.appendChild(DOMElements.emptyInbox); }
+        else { inboxMessages.forEach(msg => DOMElements.inboxList.appendChild(buildMessageItem(msg, false))); }
+    },
+    renderTrash: () => {
+        DOMElements.trashList.innerHTML = '';
+        const trashMessages = state.messages.filter(m => state.deletedIds.includes(m.id));
+        if (trashMessages.length === 0) {
+            DOMElements.trashList.innerHTML = `<div class="inbox-empty"><span class="material-symbols-outlined" style="font-size:48px; color:var(--text-secondary); margin-bottom:12px; display:block;">delete_outline</span><div class="big">Recycle Bin is empty</div><div class="small">Deleted emails will appear here.</div></div>`;
+        } else { trashMessages.forEach(msg => DOMElements.trashList.appendChild(buildMessageItem(msg, true))); }
+    },
+    renderEmailDetails: (message) => {
+        const name = senderOf(message);
+        DOMElements.emailSubjectHeader.textContent = message.subject || '(No Subject)';
+        DOMElements.emailSenderName.textContent = name;
+        DOMElements.emailSenderAddress.textContent = `<${message.from?.address || ''}>`;
+        DOMElements.emailTimestamp.textContent = new Date(message.createdAt).toLocaleString();
+        DOMElements.emailAvatar.textContent = initialOf(name);
+        UI.renderEmailBody(message, false);
         if (state.viewingTrash) {
             DOMElements.deleteMessageBtn.style.display = 'none';
             DOMElements.restoreMessageBtn.style.display = 'flex';
@@ -687,19 +720,52 @@ const UI = {
             DOMElements.restoreMessageBtn.style.display = 'none';
             DOMElements.permDeleteMessageBtn.style.display = 'none';
         }
-    }, 
-    renderHistory: () => { 
-        const history = Storage.getHistory(); DOMElements.historyList.innerHTML = ''; 
-        if (history.length === 0) { 
-            DOMElements.historyList.innerHTML = `<div style="text-align:center; color:var(--text-secondary); padding:20px; font-family:var(--font-family-code); font-size:13px;">No history available.</div>`; 
-        } else { 
-            history.forEach(account => { 
-                const historyItem = document.createElement('div'); historyItem.className = "history-item"; 
-                historyItem.innerHTML = ` <div class="avatar"><span class="material-symbols-outlined" style="color:var(--text-active); font-size: 22px;">history</span></div> <div class="item-content"> <div class="sender" style="font-family:var(--font-family-code); font-size:14px;">${account.address}</div> </div> `; 
-                historyItem.onclick = () => switchToAccount(account); DOMElements.historyList.appendChild(historyItem); 
-            }); 
-        } 
-    }, 
+    },
+    renderEmailBody: (message, allowImages = false) => {
+        // Untrusted HTML: strip active content, then show it in a script-less sandboxed iframe with a strict CSP.
+        const box = DOMElements.emailBody; box.textContent = '';
+        const rawHtml = Array.isArray(message.html) ? message.html.join('') : (message.html || '');
+        if (!rawHtml.trim()) {
+            const p = document.createElement('p'); p.style.whiteSpace = 'pre-wrap'; p.textContent = message.text || ''; box.appendChild(p); return;
+        }
+        const doc = new DOMParser().parseFromString(rawHtml, 'text/html');
+        doc.querySelectorAll('script, iframe, frame, object, embed, applet, form, meta, base, link, noscript').forEach(el => el.remove());
+        doc.querySelectorAll('*').forEach(el => { for (const a of Array.from(el.attributes)) { if (/^on/i.test(a.name)) el.removeAttribute(a.name); } });
+        doc.querySelectorAll('a').forEach(a => {
+            if (/^\s*javascript:/i.test(a.getAttribute('href') || '')) a.removeAttribute('href');
+            a.setAttribute('target', '_blank'); a.setAttribute('rel', 'noopener noreferrer nofollow');
+        });
+        const remoteImages = doc.querySelectorAll('img[src^="http"], img[srcset]').length;
+        const styles = Array.from(doc.head.querySelectorAll('style')).map(s => s.outerHTML).join('');
+        if (remoteImages && !allowImages) {
+            const bar = document.createElement('div');
+            bar.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;font-size:12px;color:var(--text-secondary);margin-bottom:12px;';
+            const note = document.createElement('span'); note.textContent = 'Remote images are blocked to prevent tracking.';
+            const btn = document.createElement('button'); btn.className = 'action-btn'; btn.textContent = 'Load images'; btn.style.cssText = 'font-size:12px;padding:6px 12px;';
+            btn.onclick = () => UI.renderEmailBody(message, true);
+            bar.append(note, btn); box.appendChild(bar);
+        }
+        const frame = document.createElement('iframe');
+        frame.setAttribute('sandbox', 'allow-same-origin allow-popups allow-popups-to-escape-sandbox');
+        frame.setAttribute('referrerpolicy', 'no-referrer'); frame.title = 'Email content';
+        frame.style.cssText = 'width:100%;border:0;border-radius:10px;background:#fff;display:block;min-height:120px;';
+        frame.srcdoc = `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${allowImages ? 'https: data:' : 'data:'}; style-src 'unsafe-inline'"><style>body{margin:0;padding:16px;font:15px/1.6 system-ui,sans-serif;color:#111;background:#fff;overflow-wrap:anywhere}img{max-width:100%;height:auto}a{color:#2563eb}</style>${styles}</head><body>${doc.body.innerHTML}</body></html>`;
+        frame.addEventListener('load', () => { try { frame.style.height = frame.contentDocument.documentElement.scrollHeight + 'px'; } catch (e) {} });
+        box.appendChild(frame);
+    },
+    renderHistory: () => {
+        const history = Storage.getHistory(); DOMElements.historyList.innerHTML = '';
+        if (history.length === 0) {
+            DOMElements.historyList.innerHTML = `<div style="text-align:center; color:var(--text-secondary); padding:20px; font-family:var(--font-family-code); font-size:13px;">No history available.</div>`;
+        } else {
+            history.forEach(account => {
+                const item = document.createElement('div'); item.className = "history-item";
+                item.innerHTML = `<div class="avatar"><span class="material-symbols-outlined" style="color:var(--text-active); font-size: 22px;">history</span></div> <div class="item-content"> <div class="sender" style="font-family:var(--font-family-code); font-size:14px;"></div> </div>`;
+                item.querySelector('.sender').textContent = account.address;
+                item.onclick = () => switchToAccount(account); DOMElements.historyList.appendChild(item);
+            });
+        }
+    },
     updateEmailDisplay: () => { DOMElements.tempEmailDisplay.textContent = state.account ? state.account.address : 'No active email'; }, 
     toggleSidebar: (forceClose = false) => { 
         if (forceClose) { document.body.classList.remove('left-sidebar-open'); } else { document.body.classList.toggle('left-sidebar-open'); } 
@@ -716,7 +782,7 @@ const UI = {
     } 
 };
 
-function copyToClipboard() { if (!state.account?.address) return; navigator.clipboard.writeText(state.account.address).then(() => showToast('Email copied to clipboard', 'content_paste')); } 
+function copyToClipboard() { if (!state.account?.address) return; (navigator.clipboard?.writeText(state.account.address) ?? Promise.reject()).then(() => showToast('Email copied to clipboard', 'content_paste')).catch(() => showToast('Could not copy. Select the address and copy it manually.', 'error')); }
 function hideToast() { DOMElements.toast.classList.remove('visible'); }
 
 function showToast(message, iconName = 'info', action = null) { 
@@ -750,12 +816,12 @@ function formatDate(dateString) {
     if (hours < 24) return `${hours}h ago`; return `${Math.round(hours / 24)}d ago`; 
 } 
 
-function switchToAccount(account) { 
-    Storage.saveToHistory(state.account); Storage.removeFromHistory(account.address); 
-    state.account = account; state.messages = []; state.deletedIds = []; Storage.saveSession(); 
-    UI.updateEmailDisplay(); UI.renderInbox(); UI.renderTrash(); startInboxPolling(); UI.navigateTo('home'); showToast(`Switched to ${account.address}`, 'swap_horiz'); 
+function switchToAccount(account) {
+    Storage.saveToHistory(state.account, state.deletedIds); Storage.removeFromHistory(account.address);
+    const { deletedIds, ...acct } = account;
+    state.account = acct; state.messages = []; state.deletedIds = Array.isArray(deletedIds) ? deletedIds : []; Storage.saveSession();
+    UI.updateEmailDisplay(); UI.renderInbox(); UI.renderTrash(); startInboxPolling(); UI.navigateTo('home'); showToast(`Switched to ${account.address}`, 'swap_horiz');
 }
-
 function startInboxPolling() { clearInterval(state.inboxInterval); checkInbox(); state.inboxInterval = setInterval(() => checkInbox(false), 10000); }
 
 function addEventListeners() { 
@@ -801,48 +867,36 @@ function addEventListeners() {
         } 
     }); 
 
-    DOMElements.permDeleteMessageBtn.addEventListener('click', async () => { 
-        if (state.currentMessage) { 
-            if(confirm("Permanently delete this message? This cannot be undone.")) {
-                showToast('Deleting...', 'hourglass_empty');
-                try {
-                    await fetchWithTimeout(`${API_BASE_URL}/messages/${state.currentMessage.id}`, {
-                        method: 'DELETE', headers: { 'Authorization': `Bearer ${state.account.token}` }
-                    });
-                } catch(e) { console.error("API Delete failed:", e); }
-                
-                state.messages = state.messages.filter(m => m.id !== state.currentMessage.id);
-                state.deletedIds = state.deletedIds.filter(id => id !== state.currentMessage.id);
-                Storage.saveSession(); UI.renderTrash(); UI.navigateTo('trash'); 
-                showToast('Deleted permanently', 'delete_forever'); 
-            }
-        } 
+    DOMElements.permDeleteMessageBtn.addEventListener('click', () => {
+        const msg = state.currentMessage;
+        if (!msg || !state.account) return;
+        if (!confirm("Permanently delete this message? This cannot be undone.")) return;
+        purgeMessages([msg.id]); UI.renderTrash(); UI.navigateTo('trash');
+        showToast('Deleted permanently', 'delete_forever');
     });
-    
-    DOMElements.emptyTrashBtn.addEventListener('click', async () => {
-        if(state.deletedIds.length === 0) { showToast('Recycle Bin is already empty'); return; }
-        if(confirm("Empty Recycle Bin? All messages will be permanently deleted.")) {
-            showToast('Emptying Bin...', 'hourglass_empty');
-            state.deletedIds.forEach(id => {
-                fetch(`${API_BASE_URL}/messages/${id}`, { method: 'DELETE', headers: { 'Authorization': `Bearer ${state.account.token}` } }).catch(e=>e);
-            });
-            state.messages = state.messages.filter(m => !state.deletedIds.includes(m.id));
-            state.deletedIds = [];
-            Storage.saveSession(); UI.renderTrash();
-            showToast('Recycle Bin emptied', 'delete_sweep');
-        }
+
+    DOMElements.emptyTrashBtn.addEventListener('click', () => {
+        if (!state.account || state.deletedIds.length === 0) { showToast('Recycle Bin is already empty'); return; }
+        if (!confirm("Empty Recycle Bin? All messages will be permanently deleted.")) return;
+        purgeMessages(state.deletedIds.slice()); UI.renderTrash();
+        showToast('Recycle Bin emptied', 'delete_sweep');
+    });
+
+    document.addEventListener('visibilitychange', () => {
+        if (document.hidden) { clearInterval(state.inboxInterval); }
+        else if (state.account) { startInboxPolling(); }
     });
 } 
 
-async function initApp() { 
-    const savedTheme = localStorage.getItem(THEME_KEY) || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'); 
-    document.documentElement.setAttribute('data-theme', savedTheme); UI.updateThemeIcon(savedTheme); 
-    addEventListeners(); 
-    if(window.innerWidth >= 1024) { if(DOMElements.desktopRefreshBtn) DOMElements.desktopRefreshBtn.style.display = "flex"; } 
-    if (Storage.loadSession()) { showToast("Session restored", "restore"); } else { await getNewEmail(); } 
-    if (state.account) { UI.updateEmailDisplay(); UI.renderInbox(); startInboxPolling(); } 
-    setTimeout(() => { DOMElements.splashScreen.style.opacity = '0'; setTimeout(() => DOMElements.splashScreen.style.display = 'none', 500); }, 2000); 
-} document.addEventListener('DOMContentLoaded', initApp); 
+async function initApp() {
+    const savedTheme = Storage.get(THEME_KEY) || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+    document.documentElement.setAttribute('data-theme', savedTheme); UI.updateThemeIcon(savedTheme);
+    addEventListeners();
+    if (window.innerWidth >= 1024) { if (DOMElements.desktopRefreshBtn) DOMElements.desktopRefreshBtn.style.display = "flex"; }
+    if (Storage.loadSession()) { showToast("Session restored", "restore"); UI.updateEmailDisplay(); UI.renderInbox(); UI.renderTrash(); startInboxPolling(); }
+    else { await getNewEmail(); }
+    setTimeout(() => { DOMElements.splashScreen.style.opacity = '0'; setTimeout(() => DOMElements.splashScreen.style.display = 'none', 500); }, 2000);
+} document.addEventListener('DOMContentLoaded', initApp);
 </script>
 </body>
 </html>
